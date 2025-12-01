@@ -1,0 +1,938 @@
+import React, { useState, useCallback } from 'react';
+
+// ============================================================================
+// REAL INTERVAL ARITHMETIC
+// ============================================================================
+
+const riv = (lo, hi) => ({ 
+  lo: hi === undefined ? lo : Math.min(lo, hi), 
+  hi: hi === undefined ? lo : Math.max(lo, hi) 
+});
+const rivAdd = (a, b) => riv(a.lo + b.lo, a.hi + b.hi);
+const rivSub = (a, b) => riv(a.lo - b.hi, a.hi - b.lo);
+const rivMul = (a, b) => {
+  const p = [a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi];
+  return riv(Math.min(...p), Math.max(...p));
+};
+const rivScale = (a, k) => k >= 0 ? riv(a.lo * k, a.hi * k) : riv(a.hi * k, a.lo * k);
+const rivSqrt = (a) => riv(Math.sqrt(Math.max(0, a.lo)), Math.sqrt(Math.max(0, a.hi)));
+const rivMid = (a) => (a.lo + a.hi) / 2;
+const rivWidth = (a) => a.hi - a.lo;
+
+// ============================================================================
+// COMPLEX INTERVAL ARITHMETIC
+// ============================================================================
+
+const civ = (re, im) => ({
+  re: typeof re === 'number' ? riv(re) : re,
+  im: typeof im === 'number' ? riv(im) : (im || riv(0))
+});
+const civPoint = (re, im = 0) => civ(riv(re), riv(im));
+const civZero = () => civPoint(0);
+const civAdd = (a, b) => civ(rivAdd(a.re, b.re), rivAdd(a.im, b.im));
+const civSub = (a, b) => civ(rivSub(a.re, b.re), rivSub(a.im, b.im));
+const civMul = (a, b) => civ(
+  rivSub(rivMul(a.re, b.re), rivMul(a.im, b.im)),
+  rivAdd(rivMul(a.re, b.im), rivMul(a.im, b.re))
+);
+const civScale = (a, k) => civ(rivScale(a.re, k), rivScale(a.im, k));
+const civScaleRiv = (a, k) => civ(rivMul(a.re, k), rivMul(a.im, k));
+const civConj = (a) => civ(a.re, riv(-a.im.hi, -a.im.lo));
+const civNormSq = (a) => rivAdd(rivMul(a.re, a.re), rivMul(a.im, a.im));
+const civMid = (a) => ({ re: rivMid(a.re), im: rivMid(a.im) });
+const civFormat = (a, prec = 3) => {
+  const re = rivMid(a.re).toFixed(prec);
+  const im = rivMid(a.im);
+  if (Math.abs(im) < 1e-10) return re;
+  return `${re}${im >= 0 ? '+' : ''}${im.toFixed(prec)}i`;
+};
+
+// ============================================================================
+// DENSITY MATRIX OPERATIONS
+// ============================================================================
+
+// Create zero density matrix
+const rhoZero = (dim) => {
+  const rho = [];
+  for (let i = 0; i < dim; i++) {
+    rho[i] = [];
+    for (let j = 0; j < dim; j++) {
+      rho[i][j] = civZero();
+    }
+  }
+  return rho;
+};
+
+// Create |0...0⟩⟨0...0| density matrix
+const rhoGround = (n) => {
+  const dim = 1 << n;
+  const rho = rhoZero(dim);
+  rho[0][0] = civPoint(1);
+  return rho;
+};
+
+// Pure state vector to density matrix: ρ = |ψ⟩⟨ψ|
+const pureToRho = (state) => {
+  const dim = state.length;
+  const rho = [];
+  for (let i = 0; i < dim; i++) {
+    rho[i] = [];
+    for (let j = 0; j < dim; j++) {
+      rho[i][j] = civMul(state[i], civConj(state[j]));
+    }
+  }
+  return rho;
+};
+
+// Trace of density matrix (should be 1)
+const rhoTrace = (rho) => {
+  let tr = civZero();
+  for (let i = 0; i < rho.length; i++) {
+    tr = civAdd(tr, rho[i][i]);
+  }
+  return tr;
+};
+
+// Copy density matrix
+const rhoCopy = (rho) => rho.map(row => row.map(x => civ(riv(x.re.lo, x.re.hi), riv(x.im.lo, x.im.hi))));
+
+// Add two density matrices
+const rhoAdd = (a, b) => a.map((row, i) => row.map((_, j) => civAdd(a[i][j], b[i][j])));
+
+// Scale density matrix by real interval
+const rhoScaleRiv = (rho, k) => rho.map(row => row.map(x => civScaleRiv(x, k)));
+
+// Scale density matrix by scalar
+const rhoScale = (rho, k) => rho.map(row => row.map(x => civScale(x, k)));
+
+// Matrix multiply: C = A * B
+const rhoMul = (a, b) => {
+  const dim = a.length;
+  const c = rhoZero(dim);
+  for (let i = 0; i < dim; i++) {
+    for (let j = 0; j < dim; j++) {
+      for (let k = 0; k < dim; k++) {
+        c[i][j] = civAdd(c[i][j], civMul(a[i][k], b[k][j]));
+      }
+    }
+  }
+  return c;
+};
+
+// Conjugate transpose (dagger)
+const rhoDagger = (rho) => {
+  const dim = rho.length;
+  const result = rhoZero(dim);
+  for (let i = 0; i < dim; i++) {
+    for (let j = 0; j < dim; j++) {
+      result[i][j] = civConj(rho[j][i]);
+    }
+  }
+  return result;
+};
+
+// Apply Kraus operator: ρ → K ρ K†
+const applyKraus = (rho, K) => {
+  const Kdag = rhoDagger(K);
+  return rhoMul(rhoMul(K, rho), Kdag);
+};
+
+// Fidelity with pure target state: F = ⟨ψ|ρ|ψ⟩
+const fidelityWithPure = (rho, targetState) => {
+  let f = civZero();
+  const dim = targetState.length;
+  for (let i = 0; i < dim; i++) {
+    for (let j = 0; j < dim; j++) {
+      f = civAdd(f, civMul(civMul(civConj(targetState[i]), rho[i][j]), targetState[j]));
+    }
+  }
+  return f.re; // Fidelity is real
+};
+
+// ============================================================================
+// QUANTUM GATES AS MATRICES
+// ============================================================================
+
+const SQRT2_INV = 1 / Math.sqrt(2);
+
+// 2x2 gate matrices (as density-matrix-compatible format)
+const gate2x2 = (a, b, c, d) => [[a, b], [c, d]];
+
+const GATES_2x2 = {
+  I: gate2x2(civPoint(1), civZero(), civZero(), civPoint(1)),
+  X: gate2x2(civZero(), civPoint(1), civPoint(1), civZero()),
+  Y: gate2x2(civZero(), civPoint(0, -1), civPoint(0, 1), civZero()),
+  Z: gate2x2(civPoint(1), civZero(), civZero(), civPoint(-1)),
+  H: gate2x2(civPoint(SQRT2_INV), civPoint(SQRT2_INV), civPoint(SQRT2_INV), civPoint(-SQRT2_INV)),
+};
+
+// Embed 2x2 gate into n-qubit space acting on qubit q
+const embedGate = (gate2, q, n) => {
+  const dim = 1 << n;
+  const U = rhoZero(dim);
+  
+  for (let i = 0; i < dim; i++) {
+    for (let j = 0; j < dim; j++) {
+      // Check if i and j differ only in qubit q
+      const mask = 1 << (n - 1 - q);
+      const otherBitsI = i & ~mask;
+      const otherBitsJ = j & ~mask;
+      
+      if (otherBitsI === otherBitsJ) {
+        const bitI = (i >> (n - 1 - q)) & 1;
+        const bitJ = (j >> (n - 1 - q)) & 1;
+        U[i][j] = gate2[bitI][bitJ];
+      }
+    }
+  }
+  return U;
+};
+
+// Apply unitary to density matrix: ρ → U ρ U†
+const applyUnitary = (rho, U) => {
+  const Udag = rhoDagger(U);
+  return rhoMul(rhoMul(U, rho), Udag);
+};
+
+// CNOT gate embedded
+const cnotMatrix = (c, t, n) => {
+  const dim = 1 << n;
+  const U = rhoZero(dim);
+  
+  for (let i = 0; i < dim; i++) {
+    const controlBit = (i >> (n - 1 - c)) & 1;
+    let j = i;
+    if (controlBit === 1) {
+      j = i ^ (1 << (n - 1 - t)); // Flip target
+    }
+    U[i][j] = civPoint(1);
+  }
+  return U;
+};
+
+// ============================================================================
+// NOISE CHANNELS
+// ============================================================================
+
+// Depolarizing channel on qubit q with error probability p (interval)
+// ρ → (1-p)ρ + (p/3)(XρX + YρY + ZρZ)
+const depolarizingChannel = (rho, q, n, pInterval) => {
+  const X = embedGate(GATES_2x2.X, q, n);
+  const Y = embedGate(GATES_2x2.Y, q, n);
+  const Z = embedGate(GATES_2x2.Z, q, n);
+  
+  const XrhoX = applyUnitary(rho, X);
+  const YrhoY = applyUnitary(rho, Y);
+  const ZrhoZ = applyUnitary(rho, Z);
+  
+  // (1-p)
+  const oneMinusP = rivSub(riv(1), pInterval);
+  // p/3
+  const pOver3 = rivScale(pInterval, 1/3);
+  
+  // Result = (1-p)ρ + (p/3)(XρX + YρY + ZρZ)
+  const term1 = rhoScaleRiv(rho, oneMinusP);
+  const pauliSum = rhoAdd(rhoAdd(XrhoX, YrhoY), ZrhoZ);
+  const term2 = rhoScaleRiv(pauliSum, pOver3);
+  
+  return rhoAdd(term1, term2);
+};
+
+// Amplitude damping channel (T1 decay) on qubit q
+// Models energy relaxation to |0⟩
+const amplitudeDampingChannel = (rho, q, n, gammaInterval) => {
+  const dim = 1 << n;
+  
+  // Kraus operators for single qubit:
+  // K0 = [[1, 0], [0, sqrt(1-γ)]]
+  // K1 = [[0, sqrt(γ)], [0, 0]]
+  
+  // We need interval sqrt
+  const sqrtGamma = rivSqrt(gammaInterval);
+  const sqrtOneMinusGamma = rivSqrt(rivSub(riv(1), gammaInterval));
+  
+  // Build embedded Kraus operators
+  const K0 = rhoZero(dim);
+  const K1 = rhoZero(dim);
+  
+  for (let i = 0; i < dim; i++) {
+    const bit = (i >> (n - 1 - q)) & 1;
+    if (bit === 0) {
+      K0[i][i] = civPoint(1);
+    } else {
+      // sqrt(1-γ) on diagonal for |1⟩
+      K0[i][i] = civ(sqrtOneMinusGamma, riv(0));
+      // sqrt(γ) off-diagonal |0⟩⟨1|
+      const i0 = i & ~(1 << (n - 1 - q));
+      K1[i0][i] = civ(sqrtGamma, riv(0));
+    }
+  }
+  
+  // ρ → K0 ρ K0† + K1 ρ K1†
+  return rhoAdd(applyKraus(rho, K0), applyKraus(rho, K1));
+};
+
+// Dephasing channel (T2 decay) on qubit q
+// ρ → (1-p)ρ + p·ZρZ
+const dephasingChannel = (rho, q, n, pInterval) => {
+  const Z = embedGate(GATES_2x2.Z, q, n);
+  const ZrhoZ = applyUnitary(rho, Z);
+  
+  const oneMinusP = rivSub(riv(1), pInterval);
+  
+  return rhoAdd(
+    rhoScaleRiv(rho, oneMinusP),
+    rhoScaleRiv(ZrhoZ, pInterval)
+  );
+};
+
+// ============================================================================
+// QUANTUM ERROR CORRECTION: 3-QUBIT BIT-FLIP CODE
+// ============================================================================
+
+// Encoding: |0⟩ → |000⟩, |1⟩ → |111⟩
+// Logical qubit uses physical qubits 0,1,2
+const bitFlipEncode = (rhoLogical) => {
+  // Input: 2x2 density matrix (1 logical qubit)
+  // Output: 8x8 density matrix (3 physical qubits)
+  
+  // Start with |000⟩
+  let rho = rhoGround(3);
+  
+  // If logical state has |1⟩ component, we need to encode properly
+  // For simplicity, assume input is |0⟩⟨0| or |1⟩⟨1| or superposition
+  
+  // Encoding circuit: CNOT(0→1), CNOT(0→2)
+  // This maps |ψ⟩|00⟩ → |ψ⟩|ψ⟩|ψ⟩ for ψ ∈ {0,1}
+  
+  // Build encoded state from logical density matrix
+  const rhoEncoded = rhoZero(8);
+  
+  // |000⟩⟨000| gets coefficient ρ_L[0][0]
+  // |111⟩⟨111| gets coefficient ρ_L[1][1]
+  // |000⟩⟨111| gets coefficient ρ_L[0][1]
+  // |111⟩⟨000| gets coefficient ρ_L[1][0]
+  
+  rhoEncoded[0][0] = rhoLogical[0][0]; // |000⟩⟨000|
+  rhoEncoded[0][7] = rhoLogical[0][1]; // |000⟩⟨111|
+  rhoEncoded[7][0] = rhoLogical[1][0]; // |111⟩⟨000|
+  rhoEncoded[7][7] = rhoLogical[1][1]; // |111⟩⟨111|
+  
+  return rhoEncoded;
+};
+
+// Syndrome measurement (classical, returns most likely syndrome)
+// Z0Z1 and Z1Z2 parity checks
+const bitFlipSyndrome = (rho) => {
+  // Measure parity without collapsing (approximate by looking at populations)
+  // Syndrome (s1, s2):
+  // (0,0) → no error
+  // (1,0) → error on qubit 0
+  // (1,1) → error on qubit 1
+  // (0,1) → error on qubit 2
+  
+  // Calculate probabilities of each basis state
+  const probs = [];
+  for (let i = 0; i < 8; i++) {
+    probs[i] = rivMid(rho[i][i].re);
+  }
+  
+  // Find which syndrome is most likely
+  // Group by syndrome
+  const syndromeProbs = {
+    '00': probs[0] + probs[7], // |000⟩, |111⟩ - no error
+    '10': probs[1] + probs[6], // |001⟩, |110⟩ - error on q2 (rightmost)
+    '11': probs[2] + probs[5], // |010⟩, |101⟩ - error on q1
+    '01': probs[4] + probs[3], // |100⟩, |011⟩ - error on q0
+  };
+  
+  // Return most likely syndrome
+  let maxProb = -1;
+  let syndrome = '00';
+  for (const [s, p] of Object.entries(syndromeProbs)) {
+    if (p > maxProb) {
+      maxProb = p;
+      syndrome = s;
+    }
+  }
+  
+  return syndrome;
+};
+
+// Apply correction based on syndrome
+const bitFlipCorrect = (rho, syndrome) => {
+  const n = 3;
+  
+  if (syndrome === '00') {
+    return rho; // No correction needed
+  } else if (syndrome === '10') {
+    // Error on qubit 2
+    const X = embedGate(GATES_2x2.X, 2, n);
+    return applyUnitary(rho, X);
+  } else if (syndrome === '11') {
+    // Error on qubit 1
+    const X = embedGate(GATES_2x2.X, 1, n);
+    return applyUnitary(rho, X);
+  } else if (syndrome === '01') {
+    // Error on qubit 0
+    const X = embedGate(GATES_2x2.X, 0, n);
+    return applyUnitary(rho, X);
+  }
+  
+  return rho;
+};
+
+// Decode: project back to logical qubit
+const bitFlipDecode = (rho) => {
+  // Logical |0⟩ = |000⟩, logical |1⟩ = |111⟩
+  const rhoLogical = rhoZero(2);
+  
+  rhoLogical[0][0] = rho[0][0]; // ⟨000|ρ|000⟩
+  rhoLogical[0][1] = rho[0][7]; // ⟨000|ρ|111⟩
+  rhoLogical[1][0] = rho[7][0]; // ⟨111|ρ|000⟩
+  rhoLogical[1][1] = rho[7][7]; // ⟨111|ρ|111⟩
+  
+  return rhoLogical;
+};
+
+// ============================================================================
+// SIMULATION SCENARIOS
+// ============================================================================
+
+const SCENARIOS = {
+  noProtection: {
+    name: "No Protection",
+    description: "Single qubit with depolarizing noise, no error correction",
+    run: (errorRate) => {
+      // Start with |+⟩ state
+      const plus = [civPoint(SQRT2_INV), civPoint(SQRT2_INV)];
+      let rho = pureToRho(plus);
+      
+      // Apply noise
+      rho = depolarizingChannel(rho, 0, 1, errorRate);
+      
+      // Fidelity with |+⟩
+      const fid = fidelityWithPure(rho, plus);
+      
+      return {
+        finalRho: rho,
+        fidelity: fid,
+        trace: rhoTrace(rho),
+        logical: true
+      };
+    }
+  },
+  
+  bitFlipCode: {
+    name: "3-Qubit Bit-Flip Code",
+    description: "Encodes logical qubit in 3 physical qubits, corrects single bit-flip errors",
+    run: (errorRate) => {
+      // Start with logical |+⟩
+      const plusLogical = [civPoint(SQRT2_INV), civPoint(SQRT2_INV)];
+      const rhoLogical = pureToRho(plusLogical);
+      
+      // Encode
+      let rho = bitFlipEncode(rhoLogical);
+      
+      // Apply noise to each physical qubit
+      rho = depolarizingChannel(rho, 0, 3, errorRate);
+      rho = depolarizingChannel(rho, 1, 3, errorRate);
+      rho = depolarizingChannel(rho, 2, 3, errorRate);
+      
+      // Syndrome measurement and correction
+      const syndrome = bitFlipSyndrome(rho);
+      rho = bitFlipCorrect(rho, syndrome);
+      
+      // Decode back to logical
+      const rhoDecoded = bitFlipDecode(rho);
+      
+      // Fidelity with original |+⟩
+      const fid = fidelityWithPure(rhoDecoded, plusLogical);
+      
+      return {
+        finalRho: rhoDecoded,
+        fidelity: fid,
+        trace: rhoTrace(rhoDecoded),
+        syndrome,
+        physical: rho,
+        logical: true
+      };
+    }
+  },
+  
+  bellWithNoise: {
+    name: "Bell State with Noise",
+    description: "Create Bell state then apply depolarizing noise to both qubits",
+    run: (errorRate) => {
+      // Create Bell state |Φ+⟩ = (|00⟩ + |11⟩)/√2
+      const bell = [civPoint(SQRT2_INV), civZero(), civZero(), civPoint(SQRT2_INV)];
+      let rho = pureToRho(bell);
+      
+      // Apply noise
+      rho = depolarizingChannel(rho, 0, 2, errorRate);
+      rho = depolarizingChannel(rho, 1, 2, errorRate);
+      
+      const fid = fidelityWithPure(rho, bell);
+      
+      return {
+        finalRho: rho,
+        fidelity: fid,
+        trace: rhoTrace(rho),
+        logical: false
+      };
+    }
+  },
+  
+  t1Decay: {
+    name: "T1 Amplitude Damping",
+    description: "Qubit in |1⟩ state experiencing energy relaxation",
+    run: (errorRate) => {
+      // Start with |1⟩
+      const one = [civZero(), civPoint(1)];
+      let rho = pureToRho(one);
+      
+      // Apply amplitude damping
+      rho = amplitudeDampingChannel(rho, 0, 1, errorRate);
+      
+      // Fidelity with |1⟩
+      const fid = fidelityWithPure(rho, one);
+      
+      // Also compute probability of measuring |0⟩ (decay)
+      const p0 = rho[0][0].re;
+      
+      return {
+        finalRho: rho,
+        fidelity: fid,
+        trace: rhoTrace(rho),
+        decayProb: p0,
+        logical: true
+      };
+    }
+  },
+  
+  t2Dephasing: {
+    name: "T2 Dephasing",
+    description: "Qubit in |+⟩ state experiencing phase randomization",
+    run: (errorRate) => {
+      // Start with |+⟩
+      const plus = [civPoint(SQRT2_INV), civPoint(SQRT2_INV)];
+      let rho = pureToRho(plus);
+      
+      // Apply dephasing
+      rho = dephasingChannel(rho, 0, 1, errorRate);
+      
+      const fid = fidelityWithPure(rho, plus);
+      
+      return {
+        finalRho: rho,
+        fidelity: fid,
+        trace: rhoTrace(rho),
+        logical: true
+      };
+    }
+  },
+  
+  comparison: {
+    name: "QEC Comparison",
+    description: "Compare fidelity with and without 3-qubit bit-flip code",
+    run: (errorRate) => {
+      const plusLogical = [civPoint(SQRT2_INV), civPoint(SQRT2_INV)];
+      
+      // Without QEC
+      let rhoNoQEC = pureToRho(plusLogical);
+      rhoNoQEC = depolarizingChannel(rhoNoQEC, 0, 1, errorRate);
+      const fidNoQEC = fidelityWithPure(rhoNoQEC, plusLogical);
+      
+      // With QEC
+      const rhoLogical = pureToRho(plusLogical);
+      let rhoQEC = bitFlipEncode(rhoLogical);
+      rhoQEC = depolarizingChannel(rhoQEC, 0, 3, errorRate);
+      rhoQEC = depolarizingChannel(rhoQEC, 1, 3, errorRate);
+      rhoQEC = depolarizingChannel(rhoQEC, 2, 3, errorRate);
+      const syndrome = bitFlipSyndrome(rhoQEC);
+      rhoQEC = bitFlipCorrect(rhoQEC, syndrome);
+      const rhoDecoded = bitFlipDecode(rhoQEC);
+      const fidQEC = fidelityWithPure(rhoDecoded, plusLogical);
+      
+      return {
+        noQEC: { fidelity: fidNoQEC, rho: rhoNoQEC },
+        withQEC: { fidelity: fidQEC, rho: rhoDecoded, syndrome },
+        improvement: rivSub(fidQEC, fidNoQEC),
+        logical: true
+      };
+    }
+  }
+};
+
+// ============================================================================
+// UI COMPONENTS
+// ============================================================================
+
+const Badge = ({ status }) => {
+  const styles = {
+    high: 'bg-green-500/20 text-green-400 border-green-500',
+    medium: 'bg-yellow-500/20 text-yellow-400 border-yellow-500',
+    low: 'bg-red-500/20 text-red-400 border-red-500',
+    running: 'bg-blue-500/20 text-blue-400 border-blue-500',
+    idle: 'bg-slate-500/20 text-slate-400 border-slate-500'
+  };
+  const labels = { high: 'HIGH FIDELITY', medium: 'DEGRADED', low: 'POOR', running: 'COMPUTING', idle: 'READY' };
+  return <span className={`px-3 py-1 rounded-full border text-xs font-bold uppercase ${styles[status] || styles.idle}`}>{labels[status] || status}</span>;
+};
+
+const FidelityGauge = ({ fidelity, label }) => {
+  if (!fidelity) return null;
+  const mid = rivMid(fidelity);
+  const pct = mid * 100;
+  const color = pct >= 99 ? 'text-green-400' : pct >= 90 ? 'text-yellow-400' : 'text-red-400';
+  
+  return (
+    <div className="text-center py-2">
+      <div className={`text-3xl font-bold ${color}`}>{pct.toFixed(2)}%</div>
+      <div className="text-slate-400 text-xs">{label || 'Fidelity'}</div>
+      <div className="text-xs text-slate-500 font-mono">[{fidelity.lo.toFixed(4)}, {fidelity.hi.toFixed(4)}]</div>
+    </div>
+  );
+};
+
+const DensityMatrixDisplay = ({ rho, label }) => {
+  if (!rho) return null;
+  const dim = rho.length;
+  
+  return (
+    <div className="space-y-2">
+      <div className="text-xs text-slate-400">{label || 'Density Matrix ρ'}</div>
+      <div className="overflow-x-auto">
+        <table className="text-xs font-mono">
+          <tbody>
+            {rho.map((row, i) => (
+              <tr key={i}>
+                {row.map((cell, j) => {
+                  const normSq = rivMid(civNormSq(cell));
+                  const opacity = Math.min(1, normSq * 2);
+                  return (
+                    <td key={j} className="p-1 border border-slate-700 text-center min-w-16"
+                      style={{ backgroundColor: `rgba(147, 51, 234, ${opacity})` }}>
+                      <span className="text-slate-200">{civFormat(cell, 2)}</span>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+const ComparisonDisplay = ({ result }) => {
+  if (!result?.noQEC || !result?.withQEC) return null;
+  
+  const noQEC = rivMid(result.noQEC.fidelity) * 100;
+  const withQEC = rivMid(result.withQEC.fidelity) * 100;
+  const improvement = withQEC - noQEC;
+  
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4">
+        <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4 text-center">
+          <div className="text-red-400 text-xs mb-1">WITHOUT QEC</div>
+          <div className="text-2xl font-bold text-red-400">{noQEC.toFixed(2)}%</div>
+          <div className="text-xs text-slate-500 font-mono">
+            [{result.noQEC.fidelity.lo.toFixed(4)}, {result.noQEC.fidelity.hi.toFixed(4)}]
+          </div>
+        </div>
+        <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-4 text-center">
+          <div className="text-green-400 text-xs mb-1">WITH QEC</div>
+          <div className="text-2xl font-bold text-green-400">{withQEC.toFixed(2)}%</div>
+          <div className="text-xs text-slate-500 font-mono">
+            [{result.withQEC.fidelity.lo.toFixed(4)}, {result.withQEC.fidelity.hi.toFixed(4)}]
+          </div>
+        </div>
+      </div>
+      <div className={`text-center p-3 rounded-lg ${improvement > 0 ? 'bg-emerald-500/10 border border-emerald-500/30' : 'bg-slate-700'}`}>
+        <div className="text-xs text-slate-400">Certified Improvement</div>
+        <div className={`text-xl font-bold ${improvement > 0 ? 'text-emerald-400' : 'text-slate-400'}`}>
+          {improvement > 0 ? '+' : ''}{improvement.toFixed(2)}%
+        </div>
+        <div className="text-xs text-slate-500 font-mono">
+          Δ ∈ [{result.improvement.lo.toFixed(4)}, {result.improvement.hi.toFixed(4)}]
+        </div>
+      </div>
+      {result.withQEC.syndrome && (
+        <div className="text-center text-xs text-slate-400">
+          Syndrome detected: <span className="font-mono text-purple-400">{result.withQEC.syndrome}</span>
+          {result.withQEC.syndrome !== '00' && <span className="text-yellow-400 ml-2">(Corrected!)</span>}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ErrorRateSlider = ({ value, onChange }) => (
+  <div className="space-y-2">
+    <div className="flex justify-between text-sm">
+      <span className="text-slate-400">Error Rate (p)</span>
+      <span className="font-mono text-cyan-400">{(rivMid(value) * 100).toFixed(1)}% ± {(rivWidth(value) * 100 / 2).toFixed(1)}%</span>
+    </div>
+    <input
+      type="range"
+      min="0"
+      max="30"
+      value={rivMid(value) * 100}
+      onChange={(e) => {
+        const mid = parseFloat(e.target.value) / 100;
+        const width = 0.002; // ±0.2% uncertainty
+        onChange(riv(Math.max(0, mid - width), mid + width));
+      }}
+      className="w-full accent-purple-500"
+    />
+    <div className="flex justify-between text-xs text-slate-500">
+      <span>0%</span>
+      <span>30%</span>
+    </div>
+  </div>
+);
+
+const Certificate = ({ result, scenario }) => {
+  const [show, setShow] = useState(false);
+  if (!result) return null;
+  
+  const fid = result.fidelity || result.withQEC?.fidelity;
+  const fidMid = fid ? rivMid(fid) : 0;
+  const status = fidMid >= 0.99 ? 'high' : fidMid >= 0.9 ? 'medium' : 'low';
+  
+  return (
+    <div className="bg-slate-800 rounded-lg border border-slate-600 overflow-hidden">
+      <div className="bg-slate-700/50 px-4 py-2 flex items-center justify-between">
+        <span className="font-semibold text-sm">📜 Quantum Certificate</span>
+        <Badge status={status} />
+      </div>
+      <div className="p-4 space-y-4">
+        {result.noQEC ? (
+          <ComparisonDisplay result={result} />
+        ) : (
+          <>
+            <FidelityGauge fidelity={result.fidelity} />
+            {result.trace && (
+              <div className="text-xs text-center text-slate-400">
+                Tr(ρ) = <span className="font-mono text-cyan-400">[{result.trace.re.lo.toFixed(4)}, {result.trace.re.hi.toFixed(4)}]</span>
+                <span className="text-slate-500 ml-2">(should be 1.0)</span>
+              </div>
+            )}
+            {result.decayProb && (
+              <div className="text-xs text-center text-slate-400">
+                P(decay to |0⟩) = <span className="font-mono text-orange-400">[{result.decayProb.lo.toFixed(4)}, {result.decayProb.hi.toFixed(4)}]</span>
+              </div>
+            )}
+            {result.syndrome && (
+              <div className="text-xs text-center text-slate-400">
+                Syndrome: <span className="font-mono text-purple-400">{result.syndrome}</span>
+              </div>
+            )}
+          </>
+        )}
+        
+        {result.finalRho && (
+          <DensityMatrixDisplay rho={result.finalRho} label={result.logical ? "Logical Qubit ρ" : "Physical State ρ"} />
+        )}
+        
+        <div className="text-xs text-slate-500 pt-2 border-t border-slate-700">
+          Engine: QCE v2.0 | Time: {new Date().toISOString()}
+        </div>
+        
+        <button onClick={() => setShow(!show)} className="text-xs text-cyan-400 hover:text-cyan-300">
+          {show ? '▼ Hide' : '▶ Show'} Technical Details
+        </button>
+        {show && (
+          <pre className="text-xs bg-slate-900 p-2 rounded overflow-auto max-h-40 text-slate-300">
+            {JSON.stringify({ scenario, fidelity: fid, trace: result.trace }, null, 2)}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ============================================================================
+// MAIN APP
+// ============================================================================
+
+export default function QuantumCertaintyEngineV2() {
+  const [selectedScenario, setSelectedScenario] = useState(null);
+  const [errorRate, setErrorRate] = useState(riv(0.048, 0.052)); // 5% ± 0.2%
+  const [result, setResult] = useState(null);
+  const [status, setStatus] = useState('idle');
+
+  const runSimulation = useCallback((scenarioKey) => {
+    setSelectedScenario(scenarioKey);
+    setStatus('running');
+    setResult(null);
+    
+    setTimeout(() => {
+      const scenario = SCENARIOS[scenarioKey];
+      const res = scenario.run(errorRate);
+      setResult(res);
+      
+      const fid = res.fidelity || res.withQEC?.fidelity;
+      const fidMid = fid ? rivMid(fid) : 0;
+      setStatus(fidMid >= 0.99 ? 'high' : fidMid >= 0.9 ? 'medium' : 'low');
+    }, 300);
+  }, [errorRate]);
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-white p-4">
+      <div className="max-w-5xl mx-auto space-y-4">
+        
+        {/* Header */}
+        <div className="border-b border-slate-700 pb-3">
+          <h1 className="text-2xl font-bold bg-gradient-to-r from-purple-400 via-pink-400 to-cyan-400 bg-clip-text text-transparent">
+            Quantum Certainty Engine v2
+          </h1>
+          <p className="text-slate-500 text-sm">Density Matrices • Noise Channels • Quantum Error Correction</p>
+          <p className="text-slate-600 text-xs">
+            © 2025 Lucas Postma (<a href="https://x.com/BeingAsSuch" className="text-cyan-500">@BeingAsSuch</a>)
+          </p>
+        </div>
+
+        {/* Error Rate Control */}
+        <div className="bg-slate-800/50 rounded-lg p-4">
+          <ErrorRateSlider value={errorRate} onChange={setErrorRate} />
+          <div className="text-xs text-slate-500 mt-2">
+            Interval bounds model uncertainty in physical error rate calibration
+          </div>
+        </div>
+
+        {/* Scenario Selection */}
+        <div className="bg-slate-800/50 rounded-lg p-4">
+          <div className="text-xs text-slate-400 mb-3">Select Noise Scenario:</div>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+            {Object.entries(SCENARIOS).map(([key, s]) => (
+              <button
+                key={key}
+                onClick={() => runSimulation(key)}
+                disabled={status === 'running'}
+                className={`p-3 rounded-lg text-left transition-all ${
+                  selectedScenario === key 
+                    ? 'bg-purple-600 ring-2 ring-purple-400' 
+                    : 'bg-slate-700 hover:bg-slate-600'
+                } disabled:opacity-50`}
+              >
+                <div className="font-medium text-sm">{s.name}</div>
+                <div className="text-xs text-slate-400 mt-1 line-clamp-2">{s.description}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Main Content */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          
+          {/* Left: Status */}
+          <div className="space-y-4">
+            <div className="bg-slate-800 rounded-lg p-4">
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-sm text-slate-300">Simulation Status</span>
+                <Badge status={status} />
+              </div>
+              
+              {status === 'running' && (
+                <div className="text-center py-8">
+                  <div className="text-4xl mb-2 animate-pulse">⚛</div>
+                  <div className="text-blue-400 font-bold">Simulating noise channels...</div>
+                </div>
+              )}
+              
+              {status === 'idle' && (
+                <div className="text-center py-8 text-slate-500">
+                  Select a scenario to simulate quantum noise
+                </div>
+              )}
+              
+              {result && status !== 'running' && status !== 'idle' && (
+                <div className="text-center py-4">
+                  <div className="text-5xl mb-2">
+                    {status === 'high' ? '✓' : status === 'medium' ? '⚠' : '✗'}
+                  </div>
+                  <div className={`font-bold text-xl ${status === 'high' ? 'text-green-400' : status === 'medium' ? 'text-yellow-400' : 'text-red-400'}`}>
+                    {status === 'high' ? 'HIGH FIDELITY' : status === 'medium' ? 'DEGRADED' : 'SIGNIFICANT DECOHERENCE'}
+                  </div>
+                  <div className="text-slate-400 text-sm mt-1">
+                    {selectedScenario && SCENARIOS[selectedScenario]?.description}
+                  </div>
+                </div>
+              )}
+            </div>
+            
+            {/* Noise Model Info */}
+            {selectedScenario && (
+              <div className="bg-slate-800 rounded-lg p-4 text-sm">
+                <div className="text-xs text-slate-400 mb-2">Active Noise Model</div>
+                <div className="space-y-2 text-slate-300">
+                  {selectedScenario === 'noProtection' && (
+                    <p>Single qubit depolarizing: ρ → (1-p)ρ + (p/3)(XρX + YρY + ZρZ)</p>
+                  )}
+                  {selectedScenario === 'bitFlipCode' && (
+                    <p>3-qubit bit-flip code with depolarizing noise on each physical qubit. Syndrome measurement corrects single-qubit errors.</p>
+                  )}
+                  {selectedScenario === 't1Decay' && (
+                    <p>Amplitude damping: K₀ = diag(1, √(1-γ)), K₁ = [[0,√γ],[0,0]]</p>
+                  )}
+                  {selectedScenario === 't2Dephasing' && (
+                    <p>Dephasing: ρ → (1-p)ρ + p·ZρZ</p>
+                  )}
+                  {selectedScenario === 'comparison' && (
+                    <p>Side-by-side comparison of single qubit vs. 3-qubit encoded with identical per-qubit error rates.</p>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Right: Certificate */}
+          <div className="space-y-4">
+            <Certificate result={result} scenario={selectedScenario} />
+          </div>
+        </div>
+
+        {/* Technical Details */}
+        <details className="bg-slate-800/50 rounded-lg">
+          <summary className="px-4 py-3 cursor-pointer text-sm text-slate-400 hover:text-white">
+            Technical Details: Noise Channels & QEC
+          </summary>
+          <div className="p-4 border-t border-slate-700 text-sm text-slate-400 space-y-3">
+            <div>
+              <strong className="text-purple-400">Density Matrices:</strong> Mixed states represented as ρ (Hermitian, Tr(ρ)=1, positive semidefinite). 
+              Each element is a complex interval for certified bounds.
+            </div>
+            <div>
+              <strong className="text-purple-400">Depolarizing Channel:</strong> ρ → (1-p)ρ + (p/3)(XρX + YρY + ZρZ). 
+              Models random Pauli errors with probability p.
+            </div>
+            <div>
+              <strong className="text-purple-400">Amplitude Damping (T1):</strong> Energy relaxation to ground state. 
+              Kraus operators K₀, K₁ with decay parameter γ.
+            </div>
+            <div>
+              <strong className="text-purple-400">Dephasing (T2):</strong> ρ → (1-p)ρ + pZρZ. 
+              Phase randomization without energy loss.
+            </div>
+            <div>
+              <strong className="text-purple-400">3-Qubit Bit-Flip Code:</strong> |0⟩→|000⟩, |1⟩→|111⟩. 
+              Syndromes Z₀Z₁, Z₁Z₂ detect single bit-flips. Corrects errors below threshold.
+            </div>
+            <div className="text-xs text-slate-500 pt-2 border-t border-slate-700">
+              All computations use interval arithmetic. Uncertainty in error rate p propagates to certified fidelity bounds.
+            </div>
+          </div>
+        </details>
+
+        {/* Footer */}
+        <div className="text-center text-xs text-slate-600">
+          Quantum Certainty Engine v2.0 • Density matrices • Kraus operators • QEC • Certified bounds
+        </div>
+      </div>
+    </div>
+  );
+}
